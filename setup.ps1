@@ -1,4 +1,4 @@
-﻿# setup.ps1 - Cloudflare IP 优选工具一键部署脚本（防闪退版）
+﻿# setup.ps1 - Cloudflare IP 优选工具一键部署脚本
 # 
 # 用法：直接双击运行，或右键“使用 PowerShell 运行”即可，脚本会自动请求管理员权限。
 
@@ -79,14 +79,29 @@ function Refresh-EnvPath {
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
 }
 
+# ---------- 辅助函数：用 Python import 检测包是否已安装 ----------
+# 避免 pip show / import 的 stderr 输出被 $ErrorActionPreference = "Stop" 当成致命错误
+function Test-PyPackage {
+    param(
+        [string]$PythonExe,
+        [string]$Module
+    )
+    $oldEAP = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try {
+        $null = & $PythonExe -c "import $Module" 2>&1
+        return ($LASTEXITCODE -eq 0)
+    } finally {
+        $ErrorActionPreference = $oldEAP
+    }
+}
+
 # ---------- 计算下一个整点5分钟时间（用于首次触发）----------
 function Get-NextAlignedTime {
     param([int]$IntervalMinutes = 5)
     $now = Get-Date
-    # 计算当前分钟数距离下一个 Interval 分钟整点的分钟数
     $currentTotalMinutes = $now.Hour * 60 + $now.Minute
     $nextTotalMinutes = [math]::Ceiling($currentTotalMinutes / $IntervalMinutes) * $IntervalMinutes
-    # 构造下一个整点时间
     $nextTime = $now.Date.AddMinutes($nextTotalMinutes)
     return $nextTime
 }
@@ -150,16 +165,58 @@ if ($curlCmd) {
     Write-Host "✅ curl 安装完成。" -ForegroundColor Green
 }
 
-# ---------- 4. 安装 Python 依赖 requests（智能跳过） ----------
-Write-Host "[4/4] 检查 Python 包 requests..." -ForegroundColor Green
-$requestsInstalled = & $PythonExePath -m pip show requests 2>$null
-if ($requestsInstalled) {
-    Write-Host "✅ requests 已安装，跳过。" -ForegroundColor Gray
+# ---------- 4. 安装所有 Python 依赖（requests, aiohttp, brotlicffi）----------
+Write-Host "[4/4] 检查并安装 Python 依赖..." -ForegroundColor Green
+
+# 先升级 pip，确保安装过程顺畅
+Write-Host "  升级 pip..." -ForegroundColor Gray
+& $PythonExePath -m pip install --upgrade pip --quiet
+
+# 检查并安装 requests
+if (Test-PyPackage -PythonExe $PythonExePath -Module "requests") {
+    Write-Host "  ✅ requests 已安装" -ForegroundColor Gray
 } else {
-    Write-Host "正在安装 requests..." -ForegroundColor Yellow
-    & $PythonExePath -m pip install --upgrade pip --quiet
+    Write-Host "  安装 requests..." -ForegroundColor Yellow
     & $PythonExePath -m pip install requests --quiet
-    Write-Host "✅ requests 库安装完成。" -ForegroundColor Green
+    if (Test-PyPackage -PythonExe $PythonExePath -Module "requests") {
+        Write-Host "  ✅ requests 安装完成" -ForegroundColor Green
+    } else {
+        Write-Host "  ❌ requests 安装失败，请手动执行: pip install requests" -ForegroundColor Red
+    }
+}
+
+# 检查并安装 aiohttp
+if (Test-PyPackage -PythonExe $PythonExePath -Module "aiohttp") {
+    Write-Host "  ✅ aiohttp 已安装" -ForegroundColor Gray
+} else {
+    Write-Host "  安装 aiohttp..." -ForegroundColor Yellow
+    & $PythonExePath -m pip install aiohttp --quiet
+    if (Test-PyPackage -PythonExe $PythonExePath -Module "aiohttp") {
+        Write-Host "  ✅ aiohttp 安装完成" -ForegroundColor Green
+    } else {
+        Write-Host "  ❌ aiohttp 安装失败，请手动执行: pip install aiohttp" -ForegroundColor Red
+    }
+}
+
+# 检查并安装 brotli 解压支持（优先 brotlicffi，纯 Python 实现，兼容性更好）
+if (Test-PyPackage -PythonExe $PythonExePath -Module "brotlicffi") {
+    Write-Host "  ✅ brotlicffi 已安装" -ForegroundColor Gray
+} elseif (Test-PyPackage -PythonExe $PythonExePath -Module "brotli") {
+    Write-Host "  ✅ brotli 已安装" -ForegroundColor Gray
+} else {
+    Write-Host "  安装 brotlicffi（解压支持）..." -ForegroundColor Yellow
+    & $PythonExePath -m pip install brotlicffi --quiet
+    if (Test-PyPackage -PythonExe $PythonExePath -Module "brotlicffi") {
+        Write-Host "  ✅ brotlicffi 安装完成" -ForegroundColor Green
+    } else {
+        Write-Host "  ⚠️ brotlicffi 安装失败，尝试安装 brotli..." -ForegroundColor Yellow
+        & $PythonExePath -m pip install brotli --quiet
+        if (Test-PyPackage -PythonExe $PythonExePath -Module "brotli") {
+            Write-Host "  ✅ brotli 安装完成" -ForegroundColor Green
+        } else {
+            Write-Host "  ❌ brotli 解压库安装失败，请手动执行: pip install brotlicffi" -ForegroundColor Red
+        }
+    }
 }
 Write-Host ""
 
@@ -186,53 +243,46 @@ if (-not (Test-Path $PythonScriptPath)) {
 Write-Host "正在配置 Windows 计划任务 '$TaskName' ..." -ForegroundColor Yellow
 Write-Host "   首次运行时间: $startBoundaryStr (之后每 $TaskIntervalMinutes 分钟永久重复，无限期)" -ForegroundColor Gray
 
-# 方案一（优先）：使用 COM 对象（更可靠，支持无限期设置）
 try {
     $taskService = New-Object -ComObject Schedule.Service
     $taskService.Connect()
     $rootFolder = $taskService.GetFolder("\")
 
-    # 删除已存在的同名任务
     try { $rootFolder.DeleteTask($TaskName, 0) } catch { }
 
     $taskDefinition = $taskService.NewTask(0)
-    $taskDefinition.RegistrationInfo.Description = "每$TaskIntervalMinutes分钟运行一次 Cloudflare IP 优选工具（永久重复）"
+    $taskDefinition.RegistrationInfo.Description = "每$($TaskIntervalMinutes)分钟运行一次 Cloudflare IP 优选工具（永久重复）"
 
-    # 使用 SYSTEM 账户（LogonType = 5）
     $taskDefinition.Principal.LogonType = 5
-    $taskDefinition.Principal.RunLevel = 1   # 最高权限
+    $taskDefinition.Principal.RunLevel = 1
 
-    # 任务设置
     $taskDefinition.Settings.Enabled = $true
     $taskDefinition.Settings.StartWhenAvailable = $false
     $taskDefinition.Settings.AllowHardTerminate = $true
     $taskDefinition.Settings.ExecutionTimeLimit = "PT72H"
     $taskDefinition.Settings.MultipleInstances = 3
-    $taskDefinition.Settings.Priority = 1
+    $taskDefinition.Settings.Priority = 0
     $taskDefinition.Settings.DisallowStartIfOnBatteries = $true
     $taskDefinition.Settings.StopIfGoingOnBatteries = $true
 
-    # 触发器：一次性 (TASK_TRIGGER_TIME) + 无限期重复
     $trigger = $taskDefinition.Triggers.Create(1)
     $trigger.StartBoundary = $startBoundaryStr
     $trigger.Repetition.Interval = "PT${TaskIntervalMinutes}M"
-    $trigger.Repetition.StopAtDurationEnd = $false   # 无限期
+    $trigger.Repetition.StopAtDurationEnd = $false
     $trigger.Enabled = $true
 
-    # 操作：直接调用 Python
     $action = $taskDefinition.Actions.Create(0)
     $action.Path = $PythonExePath
     $action.Arguments = "`"$PythonScriptPath`""
     $action.WorkingDirectory = $WorkingDirectory
 
-    # 注册任务
     $rootFolder.RegisterTaskDefinition(
         $TaskName,
         $taskDefinition,
-        6,          # TASK_CREATE_OR_UPDATE
+        6,
         "SYSTEM",
         $null,
-        5           # TASK_LOGON_SERVICE_ACCOUNT
+        5
     ) | Out-Null
 
     Write-Host "✅ 计划任务 '$TaskName' 创建成功！" -ForegroundColor Green
@@ -246,7 +296,6 @@ try {
     Write-Host "⚠️ COM 对象创建失败: $_" -ForegroundColor Yellow
     Write-Host "   尝试使用 schtasks 命令作为备选方案..." -ForegroundColor Yellow
 
-    # 方案二（备选）：使用 schtasks 命令
     $schtasksArgs = @(
         "/Create",
         "/TN", $TaskName,
@@ -255,7 +304,7 @@ try {
         "/ST", $startTimeDisplay,
         "/SD", $firstRunTime.ToString("yyyy/MM/dd"),
         "/RI", $TaskIntervalMinutes,
-        "/DU", "9999/12/31",   # 持续时间无限期
+        "/DU", "9999/12/31",
         "/RU", "SYSTEM",
         "/F",
         "/RL", "HIGHEST"
@@ -265,33 +314,10 @@ try {
     if ($LASTEXITCODE -eq 0) {
         Write-Host "✅ 计划任务 '$TaskName' 创建成功！" -ForegroundColor Green
         Write-Host "   创建方式: schtasks" -ForegroundColor Gray
-        Write-Host "   触发器: $startBoundaryStr 首次运行，之后每 $TaskIntervalMinutes 分钟永久重复（无限期）" -ForegroundColor Gray
-        Write-Host "   执行命令: `"$PythonExePath`" `"$PythonScriptPath`"" -ForegroundColor Gray
-        Write-Host "   运行账户: SYSTEM" -ForegroundColor Gray
     } else {
-        # 两种方法均失败，提供手动创建指引
         Write-Host "❌ 自动创建计划任务失败。" -ForegroundColor Red
         Write-Host ""
-        Write-Host "请按照以下步骤手动创建任务：" -ForegroundColor Yellow
-        Write-Host "========================================" -ForegroundColor Cyan
-        Write-Host "1. 按 Win + R，输入 taskschd.msc 并回车。"
-        Write-Host "2. 右侧点击 '创建任务'。"
-        Write-Host "3. '常规' 选项卡："
-        Write-Host "   - 名称: $TaskName"
-        Write-Host "   - 勾选 '不管用户是否登录都要运行'"
-        Write-Host "   - 勾选 '使用最高权限运行'"
-        Write-Host "4. '触发器' 选项卡："
-        Write-Host "   - 新建 -> 开始任务: '按预定计划' -> 设置: '一次'"
-        Write-Host "   - 开始时间: $startBoundaryStr"
-        Write-Host "   - 高级设置: 勾选 '重复任务间隔'，选择 '$TaskIntervalMinutes 分钟'，持续时间 '无限期'"
-        Write-Host "5. '操作' 选项卡："
-        Write-Host "   - 新建 -> 操作: '启动程序'"
-        Write-Host "   - 程序或脚本: `"$PythonExePath`""
-        Write-Host "   - 添加参数: `"$PythonScriptPath`""
-        Write-Host "   - 起始于: `"$WorkingDirectory`""
-        Write-Host "6. '条件' 选项卡：如需笔记本电池下运行，取消勾选电源限制。"
-        Write-Host "7. 点击确定，输入 Windows 登录密码保存。"
-        Write-Host "========================================" -ForegroundColor Cyan
+        Write-Host "请手动创建（详见控制台输出的指引）" -ForegroundColor Yellow
     }
 }
 
